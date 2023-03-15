@@ -1,29 +1,44 @@
-param(
-    [string]$organizationName,
-    [string]$projectName,
-    [hashtable[]]$variableGroupKeyVaultPairs
+param (
+    [Parameter(Mandatory=$true)][string]$OrganizationName,
+    [Parameter(Mandatory=$true)][string]$ProjectName,
+    [Parameter(Mandatory=$true)][string]$PAT,
+    [Parameter(Mandatory=$true)][hashtable]$VariableGroupKeyVaultPairs
 )
 
-# Connect to Azure DevOps
-Connect-AzAccount
-$project = Get-AzDevOpsProject -OrganizationName $organizationName -ProjectName $projectName
+$ErrorActionPreference = "Stop"
 
-# Loop through each variable group - Key Vault pair
-foreach ($pair in $variableGroupKeyVaultPairs) {
-    # Get the variable group
-    $variableGroup = Get-AzDoVariableGroup -Name $pair.variableGroup -Project $project.Name
+# Base64 encode the personal access token
+$base64AuthInfo = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes((":$PAT")))
 
-    # Get the Key Vault
-    $keyVault = Get-AzKeyVault -VaultName $pair.keyVaultName -ResourceGroupName $pair.keyVaultResourceGroupName
+# Get the project
+Write-Host "Getting project: $projectName"
+$uriProject = "https://dev.azure.com/$organizationName/_apis/projects?api-version=6.1-preview.4"
+$project = Invoke-RestMethod -Uri $uriProject -Headers @{Authorization = "Basic $base64AuthInfo"} | Select-Object -ExpandProperty value | Where-Object { $_.name -eq $projectName }
 
-    # Export the variables to the Key Vault
-    $variables = Get-AzDoVariable -VariableGroup $variableGroup -Project $project.Name
-    foreach ($variable in $variables) {
-        $secretName = "$($variableGroup.Name)-$($variable.Name)"
-        $secretValue = ConvertTo-SecureString $variable.Value -AsPlainText -Force
-        Set-AzKeyVaultSecret -VaultName $keyVault.Name -Name $secretName -SecretValue $secretValue
-    }
+if (!$project) {
+    throw "Project not found: $projectName"
 }
 
-# Disconnect from Azure DevOps
-Disconnect-AzAccount
+$variableGroups = Invoke-RestMethod -Uri "https://dev.azure.com/$OrganizationName/$ProjectName/_apis/distributedtask/variablegroups?api-version=5.1" -Headers @{Authorization = "Basic $base64AuthInfo"}
+
+foreach ($pair in $VariableGroupKeyVaultPairs.GetEnumerator()) {
+    Write-Host "Processing variable group $($pair.Name) and Key Vault $($pair.Value)..."
+
+    $variableGroup = $variableGroups.value | Where-Object { $_.name -eq $pair.Name }
+
+    if ($null -eq $variableGroup) {
+        Write-Host "All variable groups: $($variableGroups.value | ConvertTo-Json)"
+        throw "Variable group not found: $($pair.Name)"
+    }
+
+    Write-Host "Setting Key Vault secrets for variable group $($variableGroup.name) with Key Vault $keyVaultName"
+
+    foreach ($variable in $variableGroup.variables.PSObject.Properties) {
+        $variableName = $variable.Name
+        $variableValue = $variable.Value.value
+
+        Write-Host "Setting secret for variable $variableName with value $variableValue"
+        
+        az keyvault secret set --vault-name $pair.Value --name $variableName --value $variableValue
+    }
+}
